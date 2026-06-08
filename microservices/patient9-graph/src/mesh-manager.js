@@ -4,7 +4,7 @@
  */
 
 const { getMesh } = require('@graphql-mesh/runtime');
-const { findAndParseConfig } = require('@graphql-mesh/config');
+const { processConfig } = require('@graphql-mesh/config');
 const { join } = require('path');
 const { writeFileSync, existsSync, mkdirSync } = require('fs');
 const { makeExecutableSchema } = require('@graphql-tools/schema');
@@ -53,11 +53,11 @@ class MeshManager {
       // Generate new mesh configuration
       const meshConfig = this.generateMeshConfig(servicesWithSpecs);
       
-      // Write mesh configuration file
+      // Write mesh configuration file (debuggability only; not read back)
       this.writeMeshConfig(meshConfig);
-      
-      // Rebuild mesh with new configuration
-      const success = await this.rebuildMesh();
+
+      // Rebuild mesh with the in-memory configuration
+      const success = await this.rebuildMesh(meshConfig);
       
       if (success) {
         // Update our service tracking
@@ -120,7 +120,7 @@ class MeshManager {
         {
           namingConvention: {
             mode: 'bare',
-            typeNames: 'PascalCase',
+            typeNames: 'pascalCase',
             fieldNames: 'camelCase'
           }
         }
@@ -221,7 +221,7 @@ class MeshManager {
         },
         transforms: [
           { prefix: { value: `${this.toPascalCase(entry.name)}_`, includeRootOperations: true } },
-          { namingConvention: { mode: 'bare', typeNames: 'PascalCase', fieldNames: 'camelCase' } }
+          { namingConvention: { mode: 'bare', typeNames: 'pascalCase', fieldNames: 'camelCase' } }
         ]
       };
     });
@@ -244,7 +244,7 @@ class MeshManager {
     };
 
     this.writeMeshConfig(config);
-    const success = await this.rebuildMesh();
+    const success = await this.rebuildMesh(config);
     if (success) {
       // Track for /status + health without re-running discovery.
       this.currentServices.clear();
@@ -283,7 +283,7 @@ class MeshManager {
     };
 
     this.writeMeshConfig(fallbackConfig);
-    return await this.rebuildMesh();
+    return await this.rebuildMesh(fallbackConfig);
   }
 
   /**
@@ -303,31 +303,46 @@ class MeshManager {
   }
 
   /**
-   * Rebuild GraphQL Mesh with current configuration
+   * Rebuild GraphQL Mesh from an in-memory configuration object.
+   *
+   * GQL-FED-FIX (#159): the legacy `getMesh(processConfig(...))` flow replaces the
+   * removed `findAndParseConfig` (deleted in @graphql-mesh/config 0.108.x). Callers
+   * already hold the config OBJECT (applyExplicitSources / generateMeshConfig /
+   * createFallbackConfiguration), so we process it directly instead of re-reading
+   * `.meshrc.yml` from disk. The YAML file is still written by writeMeshConfig() for
+   * debuggability, but is no longer a read dependency.
+   *
+   * The `logger` and `cache` keys are stripped before processConfig(): the legacy
+   * processConfig() treats unknown top-level keys (logger:{level}, cache:{redis})
+   * as package/module references and tries to `require()` them, which throws. They
+   * are gateway-runtime concerns, not mesh-build concerns, so dropping them is safe.
+   *
+   * @param {Object} config - In-memory mesh configuration object (sources + serve + ...)
    * @returns {Promise<boolean>} True if successful
    */
-  async rebuildMesh() {
+  async rebuildMesh(config) {
     try {
       console.log('🔄 Rebuilding GraphQL Mesh...');
-      
+
       // Dispose current mesh if exists
       if (this.mesh && typeof this.mesh.destroy === 'function') {
         await this.mesh.destroy();
       }
-      
-      // Find and parse the mesh configuration
-      const meshConfig = await findAndParseConfig({
-        configName: '.meshrc',
-        dir: this.configPath
-      });
-      
-      if (!meshConfig) {
-        throw new Error('Failed to parse mesh configuration');
+
+      if (!config || typeof config !== 'object') {
+        throw new Error('rebuildMesh requires an in-memory config object');
       }
-      
-      // Create new mesh instance
-      this.mesh = await getMesh(meshConfig);
-      
+
+      // Strip gateway-runtime-only keys the legacy processConfig cannot resolve.
+      const { logger, cache, ...meshBuildConfig } = config;
+
+      // Process the in-memory config and build the federated mesh.
+      const processed = await processConfig(meshBuildConfig, {
+        dir: this.configPath,
+        ignoreAdditionalResolvers: true
+      });
+      this.mesh = await getMesh(processed);
+
       console.log('✅ GraphQL Mesh rebuilt successfully');
       return true;
     } catch (error) {
