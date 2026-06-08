@@ -1,0 +1,46 @@
+{
+  "name": "graphql-mesh-gateway",
+  "version": "1.0.0",
+  "description": "Production-ready GraphQL federation gateway for Kubernetes services with auto-discovery",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "NODE_ENV=development node src/index.js",
+    "legacy:start": "node server.js"
+  },
+  "dependencies": {
+    "@graphql-mesh/cli": "^0.100.7",
+    "@graphql-mesh/openapi": "^1.0.0",
+    "@graphql-mesh/runtime": "^0.106.6",
+    "@graphql-mesh/transform-naming-convention": "^0.102.6",
+    "@graphql-mesh/transform-prefix": "^0.102.6",
+    "@graphql-tools/schema": "^10.0.0",
+    "@graphql-tools/stitch": "^9.0.0",
+    "@graphql-tools/utils": "^10.0.13",
+    "compression": "^1.7.4",
+    "cors": "^2.8.5",
+    "express": "^4.18.2",
+    "express-graphql": "^0.12.0",
+    "express-rate-limit": "^6.7.0",
+    "graphql": "^16.8.1",
+    "helmet": "^7.0.0",
+    "js-yaml": "^4.1.0",
+    "node-fetch": "^2.7.0"
+  },
+  "engines": {
+    "node": ">=16.0.0",
+    "npm": ">=7.0.0"
+  },
+  "keywords": [
+    "graphql",
+    "gateway",
+    "federation",
+    "kubernetes",
+    "microservices",
+    "api-gateway",
+    "service-discovery",
+    "openapi"
+  ],
+  "author": "Health Service IDP Platform",
+  "license": "MIT"
+}

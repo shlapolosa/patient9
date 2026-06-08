@@ -1,0 +1,55 @@
+# GraphQL Mesh Configuration Template
+# This template is populated by generate-mesh-config.sh with discovered services
+
+serve:
+  port: 8080
+  hostname: "0.0.0.0"
+  cors:
+    origin: "*"
+    credentials: false
+  playground: true
+  endpoint: "/graphql"
+  healthCheckEndpoint: "/healthz"
+
+sources: []
+  # Sources will be dynamically populated by service discovery
+  # Example structure:
+  # - name: "user-service"
+  #   handler:
+  #     openapi:
+  #       source: "http://user-service.default.svc.cluster.local:8080/openapi.json"
+  #       operationHeaders:
+  #         X-GraphQL-Gateway: "true"
+  #   transforms:
+  #     - prefix:
+  #         value: "UserService_"
+
+transforms:
+  # Global transforms applied to all sources
+  - rename:
+      mode: wrap
+      renames:
+        - from:
+            type: "Query"
+            field: "*"
+          to:
+            type: "Query"
+            field: "{source.name}_{field.name}"
+
+additionalTypeDefs: |
+  type Query {
+    _gateway: String
+    _health: String
+  }
+
+plugins:
+  - cors
+  - health-check
+
+cache:
+  # Simple in-memory cache for better performance
+  inmemory: {}
+
+logger:
+  level: info
+  format: json

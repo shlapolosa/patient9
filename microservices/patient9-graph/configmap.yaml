@@ -1,0 +1,46 @@
+---
+# ConfigMap for GraphQL Gateway Configuration
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: patient9-graph-config
+  namespace: default
+  labels:
+    app.kubernetes.io/name: patient9-graph
+    app.kubernetes.io/component: configuration
+    app.kubernetes.io/part-of: patient9
+data:
+  gateway.yaml: |
+    server:
+      port: 8080
+      host: "0.0.0.0"
+      cors:
+        enabled: true
+        origin: "*"
+        methods: ["GET", "POST", "OPTIONS"]
+        headers: ["Content-Type", "Authorization", "X-API-Key"]
+    
+    discovery:
+      namespace: "default"
+      labelSelector: "app.kubernetes.io/managed-by=kubevela"
+      interval: "5m"
+      autoDiscovery: true
+      retryDelay: "30s"
+      maxRetries: 3
+      federationAnnotation: "graphql.federation/enabled"
+    
+    graphql:
+      playground: true
+      introspection: false
+      endpoint: "/graphql"
+      
+    security:
+      rateLimit:
+        windowMs: 900000  # 15 minutes
+        max: 1000
+      helmet:
+        enabled: true
+        
+    logging:
+      level: "info"
+      format: "json"
