@@ -1,0 +1,624 @@
+name: Comprehensive GitOps Pipeline
+
+on:
+  push:
+    branches: [ main, develop, 'feature/*', 'hotfix/*', 'release/*' ]
+    paths:
+      - 'microservices/**'
+  pull_request:
+    branches: [ main ]
+    paths:
+      - 'microservices/**'
+  schedule:
+    # Run security scans daily at 2 AM UTC
+    - cron: '0 2 * * *'
+  workflow_dispatch:
+    # Enable manual workflow runs
+
+permissions:
+  contents: read
+  actions: read
+  security-events: write
+  packages: write
+
+env:
+  # Docker Hub settings (default)
+  DOCKERHUB_REGISTRY: docker.io
+  DOCKERHUB_USERNAME: socrates12345
+  # ACR settings
+  ACR_REGISTRY: healthidpuaeacr.azurecr.io
+  ACR_NAME: healthidpuaeacr
+  # Default registry selection (can be overridden)
+  DEFAULT_REGISTRY: acr  # or 'dockerhub' or 'both'
+  # Legacy variables for backward compatibility
+  REGISTRY: docker.io
+  REGISTRY_USERNAME: socrates12345
+  # GitOps settings
+  GITOPS_REPO: patient9-gitops
+  GITOPS_BRANCH: main
+
+jobs:
+  # Phase 1: Security Scanning
+  detect-changes:
+    runs-on: ubuntu-latest
+    outputs:
+      changed-services: ${{ steps.changes.outputs.changed-services }}
+      changed-services-json: ${{ steps.changes.outputs.changed-services-json }}
+      should-deploy: ${{ steps.changes.outputs.should-deploy }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Detect changed services
+        id: changes
+        run: |
+          # Get list of changed files
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            CHANGED_FILES=$(git diff --name-only ${{ github.event.pull_request.base.sha }}..${{ github.event.pull_request.head.sha }} | grep -E '^microservices/' || true)
+          elif [ "${{ github.event_name }}" = "schedule" ]; then
+            # For scheduled runs, scan all services with Dockerfiles
+            CHANGED_FILES=$(find microservices -name "Dockerfile" -type f | head -3)
+          elif [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            # For manual runs, scan all services
+            CHANGED_FILES=$(find microservices -type d -mindepth 1 -maxdepth 1 ! -name "README*" | head -5)
+          else
+            # For push events, check if we have previous commits
+            COMMIT_COUNT=$(git rev-list --count HEAD)
+            if [ "$COMMIT_COUNT" -gt 1 ]; then
+              CHANGED_FILES=$(git diff --name-only HEAD~1 HEAD | grep -E '^microservices/' || true)
+            else
+              # First commit - check all microservices
+              CHANGED_FILES=$(find microservices -type d -mindepth 1 -maxdepth 1 ! -name "README*" || true)
+            fi
+          fi
+          
+          echo "Debug: CHANGED_FILES=$CHANGED_FILES"
+          
+          # Extract unique service directories
+          CHANGED_SERVICES=""
+          CHANGED_SERVICES_JSON="[]"
+          
+          if [ ! -z "$CHANGED_FILES" ]; then
+            # Get service names - fix the filtering
+            SERVICE_NAMES=$(echo "$CHANGED_FILES" | sed 's|^microservices/||' | cut -d'/' -f1 | sort -u | grep -v '^README' | grep -v '\.md$' || true)
+            echo "Debug: SERVICE_NAMES=$SERVICE_NAMES"
+            
+            if [ ! -z "$SERVICE_NAMES" ]; then
+              CHANGED_SERVICES=$(echo "$SERVICE_NAMES" | tr '\n' ',' | sed 's/,$//')
+              
+              # Create JSON array for matrix (simpler approach)
+              CHANGED_SERVICES_JSON="["
+              FIRST=true
+              for service in $SERVICE_NAMES; do
+                if [ "$FIRST" = true ]; then
+                  CHANGED_SERVICES_JSON="$CHANGED_SERVICES_JSON\"$service\""
+                  FIRST=false
+                else
+                  CHANGED_SERVICES_JSON="$CHANGED_SERVICES_JSON,\"$service\""
+                fi
+              done
+              CHANGED_SERVICES_JSON="$CHANGED_SERVICES_JSON]"
+            fi
+          fi
+          
+          # Determine if we should deploy (main branch pushes or manual runs)
+          SHOULD_DEPLOY="false"
+          if [ "${{ github.event_name }}" = "push" ] && [ "${{ github.ref }}" = "refs/heads/main" ]; then
+            SHOULD_DEPLOY="true"
+          elif [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            SHOULD_DEPLOY="true"
+          fi
+          
+          echo "changed-services=$CHANGED_SERVICES" >> $GITHUB_OUTPUT
+          echo "changed-services-json=$CHANGED_SERVICES_JSON" >> $GITHUB_OUTPUT
+          echo "should-deploy=$SHOULD_DEPLOY" >> $GITHUB_OUTPUT
+          echo "Changed services: $CHANGED_SERVICES"
+          echo "Changed services JSON: $CHANGED_SERVICES_JSON"
+          echo "Should deploy: $SHOULD_DEPLOY"
+
+  vulnerability-scan:
+    needs: detect-changes
+    if: needs.detect-changes.outputs.changed-services != '' && fromJson(needs.detect-changes.outputs.changed-services-json)[0] != null
+    runs-on: ubuntu-latest
+    continue-on-error: true  # Don't block GitOps pipeline on security findings
+    strategy:
+      matrix:
+        service: ${{ fromJson(needs.detect-changes.outputs.changed-services-json) }}
+      fail-fast: false  # Continue scanning other services if one fails
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Build image for scanning
+        run: |
+          echo "🔍 Building ${{ matrix.service }} for security scanning..."
+          
+          # Determine correct build context and dockerfile
+          if [[ "${{ matrix.service }}" == "orchestration-service" ]]; then
+            BUILD_CONTEXT="./microservices"
+            DOCKERFILE_PATH="-f orchestration-service/Dockerfile"
+          else
+            BUILD_CONTEXT="./microservices/${{ matrix.service }}"
+            DOCKERFILE_PATH=""
+          fi
+          
+          docker build -t local-scan/${{ matrix.service }}:latest $DOCKERFILE_PATH "$BUILD_CONTEXT"
+
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: 'local-scan/${{ matrix.service }}:latest'
+          format: 'sarif'
+          output: 'trivy-results-${{ matrix.service }}.sarif'
+        continue-on-error: true
+
+      - name: Upload Trivy scan results to GitHub Security tab
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: 'trivy-results-${{ matrix.service }}.sarif'
+          category: 'trivy-${{ matrix.service }}'
+        continue-on-error: true
+
+      - name: Run Trivy for summary
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: 'local-scan/${{ matrix.service }}:latest'
+          format: 'table'
+        continue-on-error: true
+
+  dependency-check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Install safety
+        run: pip install safety
+
+      - name: Check Python dependencies
+        run: |
+          echo "🔍 Scanning Python dependencies for security vulnerabilities..."
+          # Scan each service's requirements
+          for req_file in $(find microservices -name "requirements.txt" -o -name "pyproject.toml"); do
+            echo "Scanning: $req_file"
+            if [[ $req_file == *"requirements.txt" ]]; then
+              safety check -r "$req_file" || true
+            fi
+          done
+        continue-on-error: true
+
+  # Phase 2: Semantic Versioning and Build
+  semantic-versioning:
+    needs: [detect-changes, vulnerability-scan, dependency-check]
+    if: always() && needs.detect-changes.outputs.changed-services != '' && needs.detect-changes.outputs.should-deploy == 'true' && needs.dependency-check.result == 'success' && (needs.vulnerability-scan.result == 'success' || needs.vulnerability-scan.result == 'failure')
+    runs-on: ubuntu-latest
+    outputs:
+      version-info: ${{ steps.versions.outputs.version-info }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Need full history for semantic versioning
+
+      - name: Generate semantic versions
+        id: versions
+        run: |
+          # Make version manager executable
+          chmod +x .github/scripts/version-manager.sh
+          
+          IFS=',' read -ra SERVICES <<< "${{ needs.detect-changes.outputs.changed-services }}"
+          VERSION_INFO=""
+          
+          for service in "${SERVICES[@]}"; do
+            if [ -f "microservices/$service/Dockerfile" ]; then
+              echo "🏷️ Generating semantic version for: $service"
+              
+              # Generate semantic version
+              SEMVER=$(.github/scripts/version-manager.sh version "$service")
+              
+              # Determine which registry to use for tags
+              if [[ "${{ env.DEFAULT_REGISTRY }}" == "acr" ]]; then
+                CONTAINER_TAGS=$(.github/scripts/version-manager.sh tags "$service" "${{ env.ACR_REGISTRY }}")
+              else
+                CONTAINER_TAGS=$(.github/scripts/version-manager.sh tags "$service" "${{ env.DOCKERHUB_REGISTRY }}/${{ env.DOCKERHUB_USERNAME }}")
+              fi
+              
+              echo "Service: $service, Version: $SEMVER"
+              echo "Container tags: $CONTAINER_TAGS"
+              
+              # Store version info
+              VERSION_INFO="$VERSION_INFO$service:$SEMVER,"
+            fi
+          done
+          
+          echo "version-info=${VERSION_INFO%,}" >> $GITHUB_OUTPUT
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # Docker Hub Login
+      - name: Log in to Docker Hub
+        if: env.DEFAULT_REGISTRY == 'dockerhub' || env.DEFAULT_REGISTRY == 'both'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.DOCKERHUB_REGISTRY }}
+          username: ${{ env.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+      
+      # ACR Login
+      - name: Login to Azure
+        if: env.DEFAULT_REGISTRY == 'acr' || env.DEFAULT_REGISTRY == 'both'
+        uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+      
+      - name: Log in to Azure Container Registry
+        if: env.DEFAULT_REGISTRY == 'acr' || env.DEFAULT_REGISTRY == 'both'
+        run: |
+          az acr login --name ${{ env.ACR_NAME }}
+
+      - name: Build and push with semantic versioning
+        run: |
+          chmod +x .github/scripts/version-manager.sh
+          
+          IFS=',' read -ra SERVICES <<< "${{ needs.detect-changes.outputs.changed-services }}"
+          
+          for service in "${SERVICES[@]}"; do
+            if [ -f "microservices/$service/Dockerfile" ]; then
+              echo "🏗️ Building $service with semantic versioning..."
+              
+              # Generate semantic version
+              SEMVER=$(.github/scripts/version-manager.sh version "$service")
+              COMMIT_SHA="${GITHUB_SHA:0:7}"
+              
+              # Determine registry settings first
+              if [[ "${{ env.DEFAULT_REGISTRY }}" == "acr" || "${{ env.DEFAULT_REGISTRY }}" == "both" ]]; then
+                # ACR is primary for 'acr' and 'both'
+                REGISTRY_URL="${{ env.ACR_REGISTRY }}"
+                REGISTRY_PREFIX=""
+                # Generate tags for ACR
+                CONTAINER_TAGS=$(.github/scripts/version-manager.sh tags "$service" "${{ env.ACR_REGISTRY }}")
+              else
+                # Docker Hub for 'dockerhub'
+                REGISTRY_URL="${{ env.DOCKERHUB_REGISTRY }}"
+                REGISTRY_PREFIX="${{ env.DOCKERHUB_USERNAME }}/"
+                # Generate tags for Docker Hub
+                CONTAINER_TAGS=$(.github/scripts/version-manager.sh tags "$service" "${{ env.DOCKERHUB_REGISTRY }}/${{ env.DOCKERHUB_USERNAME }}")
+              fi
+              
+              echo "🏷️ Service: $service"
+              echo "📦 Semantic Version: $SEMVER"
+              echo "🔖 All Tags: $CONTAINER_TAGS"
+              
+              # Build primary image with rich metadata
+              PRIMARY_TAG="${REGISTRY_URL}/${REGISTRY_PREFIX}${service}:$COMMIT_SHA"
+              
+              # Determine correct build context and dockerfile
+              if [[ "$service" == "orchestration-service" ]]; then
+                BUILD_CONTEXT="./microservices"
+                DOCKERFILE_PATH="-f orchestration-service/Dockerfile"
+              else
+                BUILD_CONTEXT="./microservices/$service"
+                DOCKERFILE_PATH=""
+              fi
+              
+              docker build -t "$PRIMARY_TAG" \
+                $DOCKERFILE_PATH \
+                --build-arg BUILD_VERSION="$SEMVER" \
+                --build-arg BUILD_COMMIT="$COMMIT_SHA" \
+                --build-arg BUILD_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+                --label "org.opencontainers.image.version=$SEMVER" \
+                --label "org.opencontainers.image.revision=${{ github.sha }}" \
+                --label "org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}" \
+                --label "org.opencontainers.image.created=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+                --label "org.opencontainers.image.title=$service" \
+                --label "org.opencontainers.image.description=AppContainer Service - $service" \
+                --label "version=$SEMVER" \
+                --label "commit=${{ github.sha }}" \
+                --label "commit-short=$COMMIT_SHA" \
+                --label "branch=${{ github.ref_name }}" \
+                --label "service=$service" \
+                --label "build-date=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+                --label "build-number=${{ github.run_number }}" \
+                --label "workflow-run=${{ github.run_id }}" \
+                "$BUILD_CONTEXT"
+              
+              # Create all semantic version tags
+              IFS=',' read -ra TAG_ARRAY <<< "$CONTAINER_TAGS"
+              for tag in "${TAG_ARRAY[@]}"; do
+                if [ "$tag" != "$PRIMARY_TAG" ]; then
+                  echo "Tagging: $tag"
+                  docker tag "$PRIMARY_TAG" "$tag"
+                fi
+              done
+              
+              # Push to primary registry
+              echo "📤 Pushing to primary registry for $service..."
+              for tag in "${TAG_ARRAY[@]}"; do
+                echo "  Pushing: $tag"
+                docker push "$tag"
+              done
+              
+              # If DEFAULT_REGISTRY is 'both', also push to secondary registry
+              if [[ "${{ env.DEFAULT_REGISTRY }}" == "both" ]]; then
+                echo "📤 Pushing to secondary registry (Docker Hub)..."
+                
+                # Secondary is always Docker Hub when primary is ACR
+                SEC_REGISTRY="${{ env.DOCKERHUB_REGISTRY }}"
+                SEC_PREFIX="${{ env.DOCKERHUB_USERNAME }}/"
+                
+                # Re-tag and push to secondary registry
+                SEC_TAG="${SEC_REGISTRY}/${SEC_PREFIX}${service}:$COMMIT_SHA"
+                docker tag "$PRIMARY_TAG" "$SEC_TAG"
+                docker push "$SEC_TAG"
+                
+                # Also push latest tag to secondary
+                docker tag "$PRIMARY_TAG" "${SEC_REGISTRY}/${SEC_PREFIX}${service}:latest"
+                docker push "${SEC_REGISTRY}/${SEC_PREFIX}${service}:latest"
+              fi
+              
+              echo "✅ Successfully built and pushed $service with version $SEMVER"
+            fi
+          done
+
+  # Phase 3: GitOps Update via Repository Dispatch
+  trigger-gitops-update:
+    needs: [detect-changes, semantic-versioning]
+    if: needs.detect-changes.outputs.changed-services != '' && needs.detect-changes.outputs.should-deploy == 'true' && needs.semantic-versioning.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger GitOps repository update
+        run: |
+          echo "🚀 Triggering GitOps repository update via dispatch event..."
+          
+          # Prepare deployment data
+          SERVICES="${{ needs.detect-changes.outputs.changed-services }}"
+          VERSION_INFO="${{ needs.semantic-versioning.outputs.version-info }}"
+          SOURCE_COMMIT="${{ github.sha }}"
+          COMMIT_SHA="${GITHUB_SHA:0:7}"
+          
+          echo "Services to update: $SERVICES"
+          echo "Version info: $VERSION_INFO"
+          echo "Source commit: $SOURCE_COMMIT"
+          
+          # Create payload for each service
+          IFS=',' read -ra SERVICE_ARRAY <<< "$SERVICES"
+
+          # Declarative-spine (W3): image base must match where the build job
+          # actually pushed. Previously hardcoded docker.io/socrates12345 even
+          # when DEFAULT_REGISTRY=acr, so the gitops OAM never got the real ref.
+          if [[ "${{ env.DEFAULT_REGISTRY }}" == "acr" || "${{ env.DEFAULT_REGISTRY }}" == "both" ]]; then
+            IMAGE_BASE="${{ env.ACR_REGISTRY }}"
+          else
+            IMAGE_BASE="${{ env.REGISTRY }}/${{ env.REGISTRY_USERNAME }}"
+          fi
+
+          DEPLOYMENTS=""
+          for service in "${SERVICE_ARRAY[@]}"; do
+            NEW_IMAGE="${IMAGE_BASE}/$service:$COMMIT_SHA"
+            
+            if [ -z "$DEPLOYMENTS" ]; then
+              DEPLOYMENTS="\"$service\": {\"image\": \"$NEW_IMAGE\", \"commit\": \"$COMMIT_SHA\"}"
+            else
+              DEPLOYMENTS="$DEPLOYMENTS, \"$service\": {\"image\": \"$NEW_IMAGE\", \"commit\": \"$COMMIT_SHA\"}"
+            fi
+          done
+          
+          echo "Deployments payload: {$DEPLOYMENTS}"
+          
+          # Set up GitHub CLI authentication
+          export GH_TOKEN="${{ secrets.PERSONAL_ACCESS_TOKEN }}"
+          
+          echo "📤 Sending dispatch event using GitHub CLI..."
+          
+          # Trigger repository dispatch using GitHub CLI with proper JSON formatting
+          if gh api repos/${{ github.repository_owner }}/${{ env.GITOPS_REPO }}/dispatches \
+            --method POST \
+            --field event_type=update-deployments \
+            --field client_payload[services]="$SERVICES" \
+            --field client_payload[version_info]="$VERSION_INFO" \
+            --field client_payload[source_commit]="$SOURCE_COMMIT" \
+            --field client_payload[registry]="${IMAGE_BASE}" \
+            --field client_payload[branch]="${{ github.ref_name }}" \
+            --field client_payload[workflow_run]="${{ github.run_id }}" \
+            --raw-field client_payload[deployments]="{$DEPLOYMENTS}"; then
+            echo "✅ GitOps repository dispatch event sent successfully!"
+            echo "🔗 GitOps repository will handle the manifest updates"
+          else
+            echo "❌ Failed to send dispatch event via GitHub CLI"
+            echo "Trying simplified dispatch approach..."
+            
+            # Fallback: Simplified dispatch with just essential data
+            if gh api repos/${{ github.repository_owner }}/${{ env.GITOPS_REPO }}/dispatches \
+              --method POST \
+              --field event_type=simple-update \
+              --field client_payload[services]="$SERVICES" \
+              --field client_payload[source_commit]="$SOURCE_COMMIT" \
+              --field client_payload[commit_sha]="${COMMIT_SHA}" \
+              --field client_payload[registry]="${IMAGE_BASE}"; then
+              echo "✅ Simplified dispatch sent successfully!"
+            else
+              echo "❌ All dispatch methods failed"
+              echo "Manual GitOps update required:"
+              echo "  Services: $SERVICES"
+              echo "  Images: ${{ env.REGISTRY }}/${{ env.REGISTRY_USERNAME }}/[service]:$COMMIT_SHA"
+              exit 1
+            fi
+          fi
+
+  # Phase 4: Generate Summary
+  deployment-summary:
+    needs: [detect-changes, semantic-versioning, trigger-gitops-update]
+    if: always() && needs.detect-changes.outputs.changed-services != ''
+    runs-on: ubuntu-latest
+    steps:
+      - name: Generate deployment summary
+        run: |
+          echo "## 🚀 Comprehensive GitOps Pipeline Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 🔍 Security Scanning" >> $GITHUB_STEP_SUMMARY
+          echo "- **Vulnerability Scan**: ${{ needs.vulnerability-scan.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Dependency Check**: ${{ needs.dependency-check.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 🏗️ Build & Deploy" >> $GITHUB_STEP_SUMMARY
+          echo "- **Changed Services**: ${{ needs.detect-changes.outputs.changed-services }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Semantic Versioning**: ${{ needs.semantic-versioning.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **GitOps Update**: ${{ needs.trigger-gitops-update.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Version Info**: ${{ needs.semantic-versioning.outputs.version-info }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 📋 Pipeline Details" >> $GITHUB_STEP_SUMMARY
+          echo "- **Source Commit**: \`${{ github.sha }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Branch**: \`${{ github.ref_name }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Build Number**: \`${{ github.run_number }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **GitOps Repo**: [${{ env.GITOPS_REPO }}](https://github.com/${{ github.repository_owner }}/${{ env.GITOPS_REPO }})" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "🎯 **Pipeline Status**: Security → Build → GitOps → Complete!"
+
+  # Phase 5: Slack Notifications
+  slack-notify-success:
+    runs-on: ubuntu-latest
+    needs: [detect-changes, semantic-versioning, trigger-gitops-update]
+    if: needs.detect-changes.outputs.changed-services != '' && needs.detect-changes.outputs.should-deploy == 'true' && needs.trigger-gitops-update.result == 'success'
+    steps:
+      - name: Send Slack Success Notification
+        run: |
+          if [ ! -z "${{ secrets.SLACK_WEBHOOK_URL }}" ]; then
+            curl -X POST -H 'Content-type: application/json' \
+              --data "{
+                \"blocks\": [
+                  {
+                    \"type\": \"header\",
+                    \"text\": {
+                      \"type\": \"plain_text\",
+                      \"text\": \"🎉 AppContainer Deployment Successful\"
+                    }
+                  },
+                  {
+                    \"type\": \"section\",
+                    \"fields\": [
+                      {
+                        \"type\": \"mrkdwn\",
+                        \"text\": \"*Services:* ${{ needs.detect-changes.outputs.changed-services }}\"
+                      },
+                      {
+                        \"type\": \"mrkdwn\",
+                        \"text\": \"*Branch:* ${{ github.ref_name }}\"
+                      },
+                      {
+                        \"type\": \"mrkdwn\",
+                        \"text\": \"*Commit:* \`${{ github.sha }}\`\"
+                      },
+                      {
+                        \"type\": \"mrkdwn\",
+                        \"text\": \"*Build #:* ${{ github.run_number }}\"
+                      }
+                    ]
+                  },
+                  {
+                    \"type\": \"section\",
+                    \"text\": {
+                      \"type\": \"mrkdwn\",
+                      \"text\": \"✅ *Pipeline Status:* Security → Build → GitOps → Complete!\\n\\n📊 *Security Scans:* ${{ needs.vulnerability-scan.result == 'success' && '✅ Passed' || needs.vulnerability-scan.result == 'failure' && '⚠️ Issues Found' || '⏭️ Skipped' }}\\n📦 *Version Info:* ${{ needs.semantic-versioning.outputs.version-info }}\\n🔗 *GitOps:* Repository dispatch sent successfully\"
+                    }
+                  },
+                  {
+                    \"type\": \"actions\",
+                    \"elements\": [
+                      {
+                        \"type\": \"button\",
+                        \"text\": {
+                          \"type\": \"plain_text\",
+                          \"text\": \"View GitHub Action\"
+                        },
+                        \"url\": \"${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\"
+                      },
+                      {
+                        \"type\": \"button\",
+                        \"text\": {
+                          \"type\": \"plain_text\",
+                          \"text\": \"GitOps Repository\"
+                        },
+                        \"url\": \"https://github.com/${{ github.repository_owner }}/${{ env.GITOPS_REPO }}\"
+                      }
+                    ]
+                  }
+                ]
+              }" \
+              "${{ secrets.SLACK_WEBHOOK_URL }}"
+          else
+            echo "Slack webhook not configured, skipping notification"
+          fi
+
+  slack-notify-failure:
+    runs-on: ubuntu-latest
+    needs: [detect-changes, vulnerability-scan, dependency-check, semantic-versioning, trigger-gitops-update]
+    if: always() && needs.detect-changes.outputs.changed-services != '' && needs.detect-changes.outputs.should-deploy == 'true' && (needs.dependency-check.result == 'failure' || needs.semantic-versioning.result == 'failure' || needs.trigger-gitops-update.result == 'failure')
+    steps:
+      - name: Send Slack Failure Notification
+        run: |
+          if [ ! -z "${{ secrets.SLACK_WEBHOOK_URL }}" ]; then
+            curl -X POST -H 'Content-type: application/json' \
+              --data "{
+                \"blocks\": [
+                  {
+                    \"type\": \"header\",
+                    \"text\": {
+                      \"type\": \"plain_text\",
+                      \"text\": \"❌ AppContainer Deployment Failed\"
+                    }
+                  },
+                  {
+                    \"type\": \"section\",
+                    \"fields\": [
+                      {
+                        \"type\": \"mrkdwn\",
+                        \"text\": \"*Services:* ${{ needs.detect-changes.outputs.changed-services }}\"
+                      },
+                      {
+                        \"type\": \"mrkdwn\",
+                        \"text\": \"*Branch:* ${{ github.ref_name }}\"
+                      },
+                      {
+                        \"type\": \"mrkdwn\",
+                        \"text\": \"*Commit:* \`${{ github.sha }}\`\"
+                      },
+                      {
+                        \"type\": \"mrkdwn\",
+                        \"text\": \"*Triggered by:* ${{ github.actor }}\"
+                      }
+                    ]
+                  },
+                  {
+                    \"type\": \"section\",
+                    \"text\": {
+                      \"type\": \"mrkdwn\",
+                      \"text\": \"❌ **Pipeline Failed**\\n\\n*Failed Jobs:*\\n${{ needs.dependency-check.result == 'failure' && '• Dependency Check\\n' || '' }}${{ needs.semantic-versioning.result == 'failure' && '• Build & Versioning\\n' || '' }}${{ needs.trigger-gitops-update.result == 'failure' && '• GitOps Deployment\\n' || '' }}\\n\\n*Security Status:* ${{ needs.vulnerability-scan.result == 'success' && '✅ Passed' || needs.vulnerability-scan.result == 'failure' && '⚠️ Issues Found' || '⏭️ Skipped' }}\\n\\nPlease check the GitHub Action logs for details.\"
+                    }
+                  },
+                  {
+                    \"type\": \"actions\",
+                    \"elements\": [
+                      {
+                        \"type\": \"button\",
+                        \"text\": {
+                          \"type\": \"plain_text\",
+                          \"text\": \"View Failed Action\"
+                        },
+                        \"url\": \"${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\"
+                      }
+                    ]
+                  }
+                ]
+              }" \
+              "${{ secrets.SLACK_WEBHOOK_URL }}"
+          else
+            echo "Slack webhook not configured, skipping notification"
+          fi
