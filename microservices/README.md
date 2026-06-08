@@ -26,3 +26,4 @@ spec:
 - (Services will be listed here as they are added)
 - patient9-graph (nodejs/graphql-gateway)
 - patient9-api (python/fastapi)
+- patient9-graph (nodejs/graphql-gateway)
