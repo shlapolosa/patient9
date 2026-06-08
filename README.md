@@ -1,2 +1,3 @@
 # patient9
-OAM-driven via app.submit (patient9)
+
+CLAUDE.md-compliant microservice application container.
