@@ -29,3 +29,4 @@ spec:
 - patient9-api (python/fastapi)
 - patient9-records (python/fastapi)
 - patient9-records (python/fastapi)
+- patient9-api (python/fastapi)
