@@ -24,4 +24,3 @@ spec:
 ## Current Services
 
 - (Services will be listed here as they are added)
-- patient9-api (python/fastapi)
