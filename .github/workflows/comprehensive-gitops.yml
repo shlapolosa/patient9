@@ -384,7 +384,15 @@ jobs:
           VERSION_INFO="${{ needs.semantic-versioning.outputs.version-info }}"
           SOURCE_COMMIT="${{ github.sha }}"
           COMMIT_SHA="${GITHUB_SHA:0:7}"
-          
+
+          # HARD-3 #170: never dispatch a mutable tag. The commit-back exists to
+          # replace the :latest bootstrap placeholder with an immutable <repo>:<sha>;
+          # an empty or "latest" sha would re-introduce the stale-digest trap.
+          if [ -z "$COMMIT_SHA" ] || [ "$COMMIT_SHA" = "latest" ]; then
+            echo "❌ Refusing to dispatch: COMMIT_SHA is empty or 'latest' ('$COMMIT_SHA')" >&2
+            exit 1
+          fi
+
           echo "Services to update: $SERVICES"
           echo "Version info: $VERSION_INFO"
           echo "Source commit: $SOURCE_COMMIT"
