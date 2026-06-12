@@ -134,7 +134,18 @@ jobs:
       - name: Build image for scanning
         run: |
           echo "🔍 Building ${{ matrix.service }} for security scanning..."
-          
+
+          # RASA-CONTAINER (2026-06-12): variant-only rasa scaffolds (mscv
+          # lib/rasa.sh) have NO top-level Dockerfile — they ship
+          # docker/rasa/Dockerfile + docker/rasa-actions/Dockerfile. Scan the
+          # rasa server image and exit; the default build below would fail.
+          if [ -f "microservices/${{ matrix.service }}/docker/rasa/Dockerfile" ]; then
+            docker build -t local-scan/${{ matrix.service }}:latest \
+              -f "microservices/${{ matrix.service }}/docker/rasa/Dockerfile" \
+              "./microservices/${{ matrix.service }}"
+            exit 0
+          fi
+
           # Determine correct build context and dockerfile
           if [[ "${{ matrix.service }}" == "orchestration-service" ]]; then
             BUILD_CONTEXT="./microservices"
@@ -218,7 +229,9 @@ jobs:
           VERSION_INFO=""
           
           for service in "${SERVICES[@]}"; do
-            if [ -f "microservices/$service/Dockerfile" ]; then
+            # RASA-CONTAINER: rasa scaffolds have no top-level Dockerfile —
+            # detect them via docker/rasa/Dockerfile so they get version info.
+            if [ -f "microservices/$service/Dockerfile" ] || [ -f "microservices/$service/docker/rasa/Dockerfile" ]; then
               echo "🏷️ Generating semantic version for: $service"
               
               # Generate semantic version
@@ -272,6 +285,57 @@ jobs:
           IFS=',' read -ra SERVICES <<< "${{ needs.detect-changes.outputs.changed-services }}"
           
           for service in "${SERVICES[@]}"; do
+            # RASA-CONTAINER (2026-06-12): variant-only rasa scaffolds (mscv
+            # lib/rasa.sh) ship docker/rasa/Dockerfile + docker/rasa-actions/
+            # Dockerfile (thin FROM rasa-base:v1.0.0 + COPY) and NO top-level
+            # Dockerfile, so the default branch below silently no-ops on them.
+            # Build BOTH images with the SERVICE DIR as context and push to ACR
+            # as <svc>-rasa:<sha> and <svc>-actions:<sha> (+ :latest convenience
+            # tags, matching existing CI behavior). Relies on the ACR login
+            # performed above (DEFAULT_REGISTRY=acr).
+            if [ -f "microservices/$service/docker/rasa/Dockerfile" ]; then
+              echo "🤖 Detected rasa scaffold for $service"
+
+              if [ ! -f "microservices/$service/docker/rasa-actions/Dockerfile" ]; then
+                echo "❌ rasa scaffold for $service is missing docker/rasa-actions/Dockerfile" >&2
+                exit 1
+              fi
+
+              SEMVER=$(.github/scripts/version-manager.sh version "$service")
+              COMMIT_SHA="${GITHUB_SHA:0:7}"
+              BUILD_CONTEXT="./microservices/$service"
+
+              for variant in rasa actions; do
+                if [ "$variant" = "rasa" ]; then
+                  VARIANT_DOCKERFILE="$BUILD_CONTEXT/docker/rasa/Dockerfile"
+                else
+                  VARIANT_DOCKERFILE="$BUILD_CONTEXT/docker/rasa-actions/Dockerfile"
+                fi
+                VARIANT_IMAGE="${{ env.ACR_REGISTRY }}/${service}-${variant}"
+
+                echo "🏗️ Building ${VARIANT_IMAGE}:${COMMIT_SHA} from $VARIANT_DOCKERFILE"
+                docker build -t "${VARIANT_IMAGE}:${COMMIT_SHA}" \
+                  -f "$VARIANT_DOCKERFILE" \
+                  --build-arg BUILD_VERSION="$SEMVER" \
+                  --build-arg BUILD_COMMIT="$COMMIT_SHA" \
+                  --build-arg BUILD_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+                  --label "org.opencontainers.image.version=$SEMVER" \
+                  --label "org.opencontainers.image.revision=${{ github.sha }}" \
+                  --label "org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}" \
+                  --label "service=${service}-${variant}" \
+                  --label "commit-short=$COMMIT_SHA" \
+                  "$BUILD_CONTEXT"
+
+                docker tag "${VARIANT_IMAGE}:${COMMIT_SHA}" "${VARIANT_IMAGE}:latest"
+                echo "📤 Pushing ${VARIANT_IMAGE}:${COMMIT_SHA} (+ :latest)"
+                docker push "${VARIANT_IMAGE}:${COMMIT_SHA}"
+                docker push "${VARIANT_IMAGE}:latest"
+              done
+
+              echo "✅ Successfully built and pushed rasa images for $service with version $SEMVER"
+              continue
+            fi
+
             if [ -f "microservices/$service/Dockerfile" ]; then
               echo "🏗️ Building $service with semantic versioning..."
               
@@ -375,6 +439,11 @@ jobs:
     if: needs.detect-changes.outputs.changed-services != '' && needs.detect-changes.outputs.should-deploy == 'true' && needs.semantic-versioning.result == 'success'
     runs-on: ubuntu-latest
     steps:
+      # RASA-CONTAINER: checkout needed to detect rasa scaffolds
+      # (docker/rasa/Dockerfile) when building the dispatch payload below.
+      - name: Checkout code
+        uses: actions/checkout@v4
+
       - name: Trigger GitOps repository update
         run: |
           echo "🚀 Triggering GitOps repository update via dispatch event..."
@@ -411,12 +480,23 @@ jobs:
 
           DEPLOYMENTS=""
           for service in "${SERVICE_ARRAY[@]}"; do
-            NEW_IMAGE="${IMAGE_BASE}/$service:$COMMIT_SHA"
-            
-            if [ -z "$DEPLOYMENTS" ]; then
-              DEPLOYMENTS="\"$service\": {\"image\": \"$NEW_IMAGE\", \"commit\": \"$COMMIT_SHA\"}"
+            # RASA-CONTAINER: rasa scaffolds ship TWO images. Carry
+            # rasaImage/actionsImage in the payload so the gitops
+            # deployment-update can yq-SET properties.rasaImage/actionsImage
+            # (the rasa-chatbot CD consumes those, not properties.image).
+            if [ -f "microservices/$service/docker/rasa/Dockerfile" ]; then
+              RASA_IMAGE="${IMAGE_BASE}/${service}-rasa:$COMMIT_SHA"
+              ACTIONS_IMAGE="${IMAGE_BASE}/${service}-actions:$COMMIT_SHA"
+              ENTRY="\"$service\": {\"image\": \"$RASA_IMAGE\", \"rasaImage\": \"$RASA_IMAGE\", \"actionsImage\": \"$ACTIONS_IMAGE\", \"commit\": \"$COMMIT_SHA\"}"
             else
-              DEPLOYMENTS="$DEPLOYMENTS, \"$service\": {\"image\": \"$NEW_IMAGE\", \"commit\": \"$COMMIT_SHA\"}"
+              NEW_IMAGE="${IMAGE_BASE}/$service:$COMMIT_SHA"
+              ENTRY="\"$service\": {\"image\": \"$NEW_IMAGE\", \"commit\": \"$COMMIT_SHA\"}"
+            fi
+
+            if [ -z "$DEPLOYMENTS" ]; then
+              DEPLOYMENTS="$ENTRY"
+            else
+              DEPLOYMENTS="$DEPLOYMENTS, $ENTRY"
             fi
           done
           
