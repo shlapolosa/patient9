@@ -135,14 +135,15 @@ jobs:
         run: |
           echo "🔍 Building ${{ matrix.service }} for security scanning..."
 
-          # RASA-CONTAINER (2026-06-12): variant-only rasa scaffolds (mscv
-          # lib/rasa.sh) have NO top-level Dockerfile — they ship
-          # docker/rasa/Dockerfile + docker/rasa-actions/Dockerfile. Scan the
-          # rasa server image and exit; the default build below would fail.
+          # RASA-CONTAINER (2026-06-13): variant-only rasa scaffolds ship
+          # docker/rasa/Dockerfile = `FROM healthidpuaeacr.azurecr.io/rasa-base`,
+          # a PRIVATE ACR base. The scan job has no ACR login, so building it here
+          # fails the job and (pre-fix) gated semantic-versioning -> no image pin
+          # ever committed (caught live on chatdemo). The thin layer is only a COPY
+          # of bot files over the ALREADY-scanned rasa-base, so there is nothing new
+          # to scan — skip the build entirely for rasa.
           if [ -f "microservices/${{ matrix.service }}/docker/rasa/Dockerfile" ]; then
-            docker build -t local-scan/${{ matrix.service }}:latest \
-              -f "microservices/${{ matrix.service }}/docker/rasa/Dockerfile" \
-              "./microservices/${{ matrix.service }}"
+            echo "⏭️  scan skipped: thin rasa layer over pre-scanned rasa-base (no ACR pull in scan job)"
             exit 0
           fi
 
